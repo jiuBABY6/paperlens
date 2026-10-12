@@ -1,420 +1,630 @@
 # PaperLens 数据流转与运行机制
 
-本文以当前代码为准，说明 PaperLens 从论文上传、解析、索引，到多轮问答、多智能体协作、长期记忆和 LLMOps 观测的完整运行过程。它既是项目理解文档，也是定位问题时的代码导航。
+> 本文只回答“数据怎样流动、状态怎样变化、失败时怎样处理”。项目定位和概念总览见 `paperlens-system-mastery-guide.md`。
 
-## 1. 系统解决什么问题
+## 1. 阅读约定
 
-PaperLens 面向科研论文阅读。它不是把整篇 PDF 直接交给大模型，而是先把论文拆成可定位、可检索、可验证的 Text、Figure 和 Table Evidence，再根据问题复杂度选择 Standard RAG 或 LangGraph 多智能体 RAG。
+每条链路统一按五个问题展开：
 
-系统遵循四条核心约束：
+1. 输入是什么；
+2. 经过哪些函数和组件；
+3. 中间状态放在哪里；
+4. 输出是什么；
+5. 失败时怎样恢复、降级或拒答。
 
-1. 回答只能引用当前论文中真实存在的 Evidence ID。
-2. 会话历史和长期记忆用于理解用户意图，不能替代论文证据。
-3. Figure、Table 问题必须执行对应模态的读取流程，不能仅凭附近正文作答。
-4. 执行成功、证据充分和答案正确分别统计，不能互相替代。
+事实优先级：当前代码 > `evals/report-dev-v4-final.json` > 说明文档。
 
-## 2. 组件与数据存储
+## 2. 进程启动与组件装配
 
-| 组件 | 职责 | 主要位置 |
-|---|---|---|
-| FastAPI | 上传、论文查询、会话、SSE、记忆、指标 API | `app/main.py` |
-| Docling | 提取章节、图片、表格和结构信息 | `app/services/parser.py` |
-| PyMuPDF | 提取页码、文本块、句子和 PDF 坐标 | `app/services/parser.py` |
-| SQLite | 保存论文、Evidence、会话、Run、Trace 和长期记忆 | `data/paperlens.sqlite3` |
-| Qdrant | 保存 BGE-M3 稠密向量索引 | `data/qdrant` 或远程 Qdrant |
-| BM25 | 根据当前论文 Chunk 临时计算词法排名 | `app/services/retrieval.py` |
-| BGE-M3 | 生成查询和 Evidence 的稠密向量 | `app/services/retrieval.py` |
-| CrossEncoder | 对融合后的候选进行精排 | `app/services/retrieval.py` |
-| DeepSeek | Query Resolver、Function Calling、证据判断和答案生成 | `app/services/reading.py` |
-| Qwen-VL | Figure 原图分析、必要时的 Table 图片降级读取 | `app/multimodal` |
-| LangGraph | Supervisor、Specialist、Critic、Repair、Answer 编排 | `app/multi_agent/graph.py` |
-| Prometheus | 保存指标 | `observability/prometheus.yml` |
-| OpenTelemetry Collector | 接收并转发 Trace | `observability/otel-collector.yml` |
-| Tempo | 保存分布式 Trace | `observability/tempo.yml` |
-| Grafana | 展示指标和 Trace | `observability/grafana` |
+`app/main.py` 在进程内装配：
 
-SQLite 中的主要业务表包括：`papers`、`chunks`、`figures`、`sentences`、`document_registry`、`qa_history`、`agent_traces`、`figure_query_cache`、`conversations`、`conversation_messages`、`agent_runs`、`paper_learning_memories` 和 `paper_memory_items`。
+- `Repository`：SQLite 业务持久化；
+- `PaperParser`：Docling/PyMuPDF 解析；
+- `HybridRetriever`：BM25、BGE-M3、Qdrant、RRF、Reranker；
+- `ReadingService`：DeepSeek 查询改写、生成、校验和 Judge；
+- `FigureUnderstandingService`：Qwen-VL 离线/在线图像理解；
+- `QueryRouter` 与 Agent Executor；
+- `ConversationService`、`QueryResolver`、`RunManager`；
+- `LongTermMemoryService`；
+- `LLMOps` 指标和 OpenTelemetry Trace。
 
-## 3. 论文上传与离线解析
+应用启动时还会把数据库中遗留的 queued/running Run 标为 interrupted。该动作解决进程异常退出后的悬挂状态，但不会自动重放未完成请求。
 
-### 3.1 上传入口
+## 3. 数据存储映射
 
-浏览器调用 `POST /api/papers`。服务端按流式方式保存文件，同时执行：
+| 数据 | 存储位置 | 主要生产者 | 主要消费者 |
+|---|---|---|---|
+| PDF、Figure/Table 图片 | 本地文件系统 | 上传/解析 | Evidence API、前端、Qwen-VL |
+| Paper、Chunk、Sentence、Figure | SQLite | Parser/Repository | 检索、Agent、前端 |
+| Dense 向量 | Qdrant | HybridRetriever.index | Dense 检索 |
+| BM25 候选 | 运行时内存 | HybridRetriever._bm25 | 当前检索请求 |
+| Conversation、Message、Run | SQLite | Conversation API | 多轮上下文、状态查询 |
+| 应用 Agent Trace | SQLite | Standard/Agentic 执行器 | Trace API、评测 |
+| LangGraph checkpoint | SQLite | LangGraphExecutor | 图状态恢复基础 |
+| Figure 问题缓存 | SQLite | FigureUnderstandingService | 重复视觉问题 |
+| 长期记忆条目/聚合 | SQLite | LongTermMemoryService | Query Resolver、学习记忆 API |
+| SSE 事件 | 当前进程内存 | RunManager | EventSource 客户端 |
+| Metrics | Prometheus | `/metrics` | Grafana |
+| OTel Trace | Tempo | OTel Collector | Grafana/Tempo |
 
-1. 检查扩展名、文件头和最大大小。
-2. 计算 SHA-256 内容哈希。
-3. 使用 `document_registry` 做内容级去重。
-4. 为新论文创建 `paper_id`，状态先设为 `processing`。
-5. 把原 PDF 保存到 `data/uploads/<paper_id>/source.pdf`。
+## 4. 链路一：上传新论文
 
-同一内容已经完成解析时会复用已有论文；正在解析时返回 processing；失败时释放占位记录并清理未完成文件和向量索引。
+### 4.1 输入
 
-### 3.2 Text 解析
-
-默认优先使用 Docling 获取章节层级和文档结构，同时使用 PyMuPDF 提取每页的文字、单词坐标和句子坐标。
-
-两者的分工是：
-
-- Docling 提供更好的逻辑结构和章节标签。
-- PyMuPDF 提供稳定的页码与 BBox，保证前端能跳转 PDF 并高亮原句。
-- Docling 失败时，系统自动降级为纯 PyMuPDF 解析，保留基础文本和图片能力。
-
-最终文本对象分为：
-
-- `Chunk`：用于 BM25、Dense 和 Reranker 检索。
-- `Sentence`：用于最终引用、Claim 校验和 PDF 高亮。
-
-### 3.3 Figure 解析
-
-Docling 优先导出 Figure 原图，同时保存：
-
-- `figure_id`
-- 页码和 BBox
-- Caption
-- Section
-- Nearby Text
-- Related Sentence IDs
-- Image Path
-
-`FigureUnderstandingService.enrich_paper()` 在建库阶段调用 Qwen-VL，为可读取图片生成结构化描述，例如 Summary、Entities、Components、Relations、Visual Evidence 和 Retrieval Keywords。
-
-原图和结构化描述分工不同：结构化描述用于检索召回；真正的纯视觉问题仍需对命中的原图执行 `analyze_figure_for_query`。
-
-### 3.4 Table 解析
-
-Docling 将表格转换为 Markdown/结构化文本，同时保留表格截图、Caption、页码、Section 和 BBox。结构化内容作为 Table Evidence 参与 BM25 和向量检索。
-
-正常情况下 Table Agent 使用 `read_table` 读取结构化行列。只有结构化解析不可用且显式开启 `TABLE_VLM_FALLBACK_ENABLED` 时，才调用 Qwen-VL 读取表格图片。
-
-### 3.5 建立检索索引
-
-系统把 Text Chunk、Figure 描述和 Table 内容转换为统一的可检索 Chunk：
-
-```text
-Text Chunk ───────────────┐
-Figure Caption + 描述 ────┼─> BGE-M3 ─> Qdrant
-Table Caption + Markdown ─┘
+```http
+POST /api/papers
+Content-Type: multipart/form-data
+file=<PDF>
 ```
 
-Dense 索引持久化到 Qdrant。BM25 不单独持久化倒排库，而是在当前论文的候选 Chunk 上计算词法得分。
+入口：`app/main.py::upload`。
 
-### 3.6 阅读卡片
+### 4.2 临时落盘与安全校验
 
-论文解析与索引完成后，DeepSeek 根据论文内容生成阅读卡片。卡片结论绑定候选 Sentence ID，避免生成无法定位到原文的摘要。
+`stage_pdf(file)`：
 
-完成后论文状态改为 `completed`，允许在线问答。
+1. 分块读取 UploadFile；
+2. 写入临时文件；
+3. 累计大小并检查上限；
+4. 检查扩展名和 `%PDF` 文件头；
+5. 计算 SHA-256；
+6. 返回临时路径和内容哈希。
 
-## 4. 会话、消息和 Run
+无效文件在进入解析器前被拒绝，临时文件随后清理。
 
-每个 Conversation 永久绑定一篇论文。用户提交消息时，系统在一个 SQLite 事务中创建：
+### 4.3 文档注册与去重
 
-- User Message
-- Agent Run
-- `client_message_id` 幂等标识
+`Repository.reserve_upload()` 使用 `BEGIN IMMEDIATE`：
 
-接口立即返回 `202` 和 `run_id`，后台异步执行本轮问答。数据库唯一约束保证同一 Conversation 同时最多只有一个 queued/running Run。
+- 已有 completed：返回现有 `paper_id`，复用结果；
+- 已有 processing：接口返回 202，避免并发重复解析；
+- 新哈希：创建 `paper_id`、processing 注册记录和论文目录。
 
-前端随后订阅：
+这一层解决的是业务幂等，不是语义去重；两个内容不同但文本相同的 PDF 仍有不同哈希。
 
-```text
-GET /api/papers/{paper_id}/conversations/{conversation_id}/runs/{run_id}/events
-```
+### 4.4 解析
 
-通过 SSE 接收 Router、LangGraph Node、Specialist、Function Call、Tool、Citation、Answer Delta 和最终状态事件。
-
-## 5. 上下文与查询消解
-
-每轮问答开始时加载：
-
-- 当前 Conversation 最近若干轮消息
-- Conversation Summary
-- 历史引用 Evidence ID
-- 当前论文的跨会话学习记忆摘要
-
-`QueryResolver` 先识别三类请求：
-
-1. `conversation_history`：例如“我之前问过哪些问题”，只读取当前会话历史。
-2. `paper_learning_memory`：例如“总结我之前研究过的内容”，读取论文级跨会话记忆。
-3. `paper_question`：需要重新进入论文 RAG。
-
-对“它、上一张图、刚才的表格”等依赖历史的追问，Resolver 会改写为可独立检索的问题。历史答案只用于消解指代，不能作为 Citation。
-
-## 6. Router 如何分流
-
-`QueryRouter` 使用可解释规则识别问题复杂度与所需模态：
-
-- 简单、单一文本事实：`standard_rag`
-- 复杂文本推理：`agentic_rag`
-- Figure、Table 或跨模态问题：`agentic_rag`
-
-显式 `Figure N`、`Table N` 会触发对应模态。方法主张与实验结果是否一致这类问题，即使没有直接写 Table，也会要求 Table Evidence。
-
-纯 Figure 问题只走 Figure 路径；纯 Table 问题只走 Table 路径，避免无意义 Text 检索。
-
-## 7. Standard RAG 数据流
-
-Standard RAG 用于简单文本事实：
+`process_paper()` 调用 `PaperParser.parse()`：
 
 ```text
-Question
-  -> BM25 + BGE-M3/Qdrant
-  -> RRF 融合
-  -> CrossEncoder 精排
-  -> 候选 Chunk
-  -> 句子级 Evidence
-  -> Grounded Answer
-  -> Claim Verification
-  -> Citation + Trace
+Docling：章节、段落、Picture、Table、OCR、表格结构和导出图片
+PyMuPDF：页面、文本块、单词、句子、BBox
+对齐：同页 + 文本相似度 + BBox 重叠
+输出：Paper(chunks, sentences, figures, metadata)
 ```
 
-支持 `bm25`、`dense`、`hybrid` 和 `hybrid-rerank`。默认最终配置使用 Hybrid + RRF + CrossEncoder，并记录 BM25、Dense、Rerank 各阶段耗时和实际降级情况。
+Text：
 
-## 8. LangGraph 多智能体数据流
+- Chunk 保留章节与页面；
+- Sentence 由词坐标和行坐标形成，可有多个 BBox；
+- Table 内容也可生成与表格 BBox 绑定的合成句子。
 
-### 8.1 图结构
+Figure：
 
-```text
-START
-  -> Supervisor Plan
-  -> Dispatch Specialists
-  -> Evidence Critic
-       -> approved/partial -> Answer Agent -> END
-       -> retry            -> Targeted Repair -> Evidence Critic
-       -> refuse           -> Structured Refusal -> END
-```
+- Picture 保存 Caption、页码、BBox、图片路径、邻近正文和相关句子 ID；
+- Docling 坐标会转换成 PDF.js 使用的顶部原点坐标体系。
 
-Planner 是 Supervisor 内部的规则规划组件，不是独立 Agent。它把问题拆成 typed sub-tasks，并给每个任务分配 Agent、查询、预算和执行模式。
+Table：
 
-### 8.2 Specialist 分工
+- 同样保存在 `Figure` 表中，但 `kind=table`；
+- `content` 保存 Markdown，之后可解析成 columns/rows。
 
-| Specialist | 白名单工具 | 成功条件 |
-|---|---|---|
-| Text Agent | `search_text`、`read_sentence` | 获得可引用文本 Evidence |
-| Figure Agent | `search_figures`、`read_figure`、`analyze_figure_for_query` | 命中 Figure 且完成问题相关原图分析 |
-| Table Agent | `search_tables`、`read_table`、可选 Table VLM fallback | 读取到结构化 Table Evidence |
+Docling 抛出异常时，解析器退回 `_parse_with_pymupdf()`。fallback 主要保证 Text；它只能提取部分嵌入式光栅图，不能等价替代 Docling 表结构。
 
-三个 Specialist 共享论文数据源，但不共享各自未提交的候选结果。它们通过 LangGraph State 中的统一 Evidence Reducer 合并最终 Evidence，并按 `evidence_id` 去重。
+### 4.5 Figure 离线理解
 
-### 8.3 Evidence Critic
+`FigureUnderstandingService.enrich_paper()` 遍历 Picture：
 
-Critic 检查：
+1. 读取导出原图；
+2. 在内存中按需要放大，不修改原文件；
+3. 将 Caption 和附近正文作为辅助上下文发送给 Qwen-VL；
+4. 保存结构化 description。
 
-- Required Modalities 是否覆盖
-- Evidence 是否为空
-- 数值与表格结果是否冲突
-- Figure 是否真的完成视觉分析
-- Specialist 是否出现可恢复错误
+输入是“整张图 + 论文局部上下文”，输出是用于以后召回的描述，不是针对某个用户问题的最终视觉证据。
 
-Critic 最多触发一次定向返工，只重新执行缺失模态对应的 Specialist，而不是重跑整个图。无法补齐时进入结构化拒答。
+单张图失败只写入 `status=error/unavailable` 和 uncertainty，上传继续。
 
-### 8.4 Answer Agent
+### 4.6 建索引
 
-Answer Agent 只接收 Critic 允许的 Evidence。生成后继续执行 Claim-level Verification：
+`HybridRetriever.index(paper)`：
 
-- 引用 ID 必须在候选 Evidence 集合内。
-- Unsupported Claim 会被删除或使状态降为 partial。
-- Evidence 不足时返回结构化拒答，而不是使用模型常识补全。
+1. `index_chunks()` 合并 Text、Figure 和 Table 检索表示；
+2. BGE-M3 批量生成归一化向量；
+3. 为当前论文重建 Qdrant collection；
+4. payload 保存 `chunk_id/page/section`；
+5. 更新 `vector_indexed` 和 `index_version`。
 
-## 9. Function Calling 与固定流程回退
+Figure 检索文本来自 Caption 和离线视觉描述；Table 检索文本来自 Caption 和 Markdown；三者共用 Qdrant collection，但保留各自 ID 和模态。
 
-Specialist 默认使用 OpenAI-compatible Function Calling 协议。每个 Agent 只能看到自己的工具 Schema，参数还会在本地进行二次校验：
+索引异常返回 `False` 并记录 `last_error`。当前实现仍可保存论文，只是索引状态为不可用；因此“completed”不严格等于“向量索引一定成功”。
 
-- 禁止额外字段
-- 检查必填字段和类型
-- 限制 `top_k`
-- 拒绝跨 Agent 工具
-- `paper_id`、文件路径和 URL 不交给模型控制
+### 4.7 阅读卡片与持久化
 
-一次 Specialist 最多执行有限模型轮次和工具步骤，并受全局模型调用、Qwen-VL 调用和总超时预算约束。
+`ReadingService.create_card()` 使用句子 ID 生成论文摘要卡片。模型失败时返回 unavailable 卡片，不阻止论文保存。
 
-若发生非法参数、空 Evidence、API 异常或协议失败，系统记录 `function_calling_fallback`，然后回退到固定 Specialist 流程。连续失败达到阈值才打开熔断器，冷却后自动试探恢复。
+`Repository.save()` 在事务中重写当前论文的 Sentence、Chunk、Figure，并清理过期 Figure Query Cache。最终响应包含论文结构、卡片、解析器、索引状态和是否复用。
 
-## 10. Evidence Contract
+### 4.8 整体失败恢复
 
-Text、Figure、Table 都转换为统一结构：
+上传主流程异常时：
 
-```json
+- 尝试删除对应 Qdrant collection；
+- 释放文档注册占位；
+- 删除新建论文目录；
+- 返回明确 HTTP 错误。
+
+这里清理的是本次新建资源，不会递归删除工作区或其他论文数据。
+
+## 5. 链路二：论文重新分析
+
+入口：`POST /api/papers/{paper_id}/reanalyze`。
+
+1. SQLite 将分析版本加一并标记 processing；
+2. 在临时工作目录重新解析；
+3. 将 Figure/Table 图片移动到版本目录；
+4. 重新做 Figure 离线理解、索引和阅读卡片；
+5. 保存新版本；
+6. 将旧版本 `active` 长期记忆标为 `stale`。
+
+失败时 `finish_reanalysis_failure()` 将论文恢复为 completed 并保留原分析数据。当前版本失效只处理 active 记忆，unresolved 不会自动改为 stale。
+
+## 6. 链路三：直接单轮问答
+
+### 6.1 输入
+
+```http
+POST /api/papers/{paper_id}/ask
 {
-  "evidence_id": "...",
-  "type": "text | figure | table",
-  "page": 1,
-  "bbox": [0, 0, 100, 100],
-  "content": "...",
-  "section": "Method",
-  "metadata": {}
+  "question": "...",
+  "strategy": "hybrid-rerank",
+  "limit": 5
 }
 ```
 
-统一 Contract 让检索、Agent、Critic、Answer、Evaluation 和前端引用使用同一种对象。Text 最终引用通常落到 Sentence；Figure/Table 引用落到对应对象本身。
+### 6.2 处理
 
-## 11. 短期与长期记忆
+`_ask_paper()`：
 
-### 11.1 会话短期记忆
+1. 读取论文并检查 completed；
+2. 若向量索引版本不匹配，尝试重建；
+3. `QueryRouter.route(question)` 选择 Standard 或 Agentic；
+4. 执行对应链路；
+5. 保存 QA History 和应用 Trace；
+6. 返回结构化结果。
 
-短期记忆仅属于当前 Conversation，包括最近消息、摘要和引用 ID。它负责追问理解和刷新恢复，不跨 Conversation 直接展示。
+直接接口没有 Conversation Message/Run，也不会使用多轮 Query Resolver。它适合调试内核和简单单轮调用。
 
-### 11.2 论文级长期记忆
+## 7. 链路四：持久化会话问答
 
-长期记忆按 `user_scope + paper_id` 隔离。当前部署只有 `local` user scope，尚未接入登录体系，因此不能宣称完整多租户隔离。
+### 7.1 提交消息
 
-每个完成 Run 会形成一个原子记忆候选：
+```http
+POST /api/papers/{paper_id}/conversations/{conversation_id}/messages
+{
+  "content": "它为什么这样设计？",
+  "client_message_id": "client-generated-id"
+}
+```
 
-- `completed + answerable=true + 至少一个 Citation` -> `active`
-- partial、拒答或无证据结果 -> `unresolved`
-- 论文重新解析导致 Evidence 版本变化 -> `stale`
-- 到期或容量淘汰 -> `archived`
-- 用户主动遗忘 -> `forgotten`
+`Repository.create_message_and_run()` 在一个事务中：
 
-记忆保存来源 Run、Conversation、解析版本、Evidence ID、模态、章节、重要性、置信度、过期时间、置顶状态和用户备注。聚合记忆只用于导航，不会成为论文事实证据。
+- 校验 Conversation 属于当前 Paper；
+- 检查 `client_message_id` 是否已经处理；
+- 阻止同一 Conversation 同时存在两个 queued/running Run；
+- 插入用户 Message；
+- 插入 queued Run。
 
-## 12. SSE 实时输出
+接口返回 202，`RunManager.start()` 启动当前进程内的后台协程。
 
-后台运行期间，`RunManager` 在内存中保存有界事件缓冲区。浏览器通过 EventSource 接收事件，并使用 `Last-Event-ID` 在进程存活期间补放遗漏事件。
+### 7.2 加载上下文
 
-SSE 能实时展示执行阶段和答案增量，但模型提供商当前返回完整响应，因此 Token 不是上游逐 Token 到达；系统是在答案生成完成后按固定字符数拆分为 `answer.delta`。
+`_execute_conversation_run()` 读取：
 
-页面刷新后，最终消息、Citation 和 Trace 从 SQLite 恢复。进程重启后旧的内存事件缓冲区不会恢复，但持久化 Run 结果仍可查询。
+- 当前 Conversation 与历史 Message；
+- 最近约 6 轮消息；
+- Conversation summary 与 memory；
+- 当前论文长期记忆聚合；
+- 最近 Citation ID。
 
-## 13. LLMOps 数据流
+`QueryResolver` 受最大字符数限制，超限时从最旧消息开始裁剪。
+
+### 7.3 Query Resolver 输出
+
+可能的 `intent`：
+
+- `paper_question`：继续 RAG；
+- `conversation_history`：回答“我刚才问过什么”等会话问题；
+- `paper_learning_memory`：回答跨会话学习记录问题。
+
+可能的结果：
+
+- `resolved_question`：可独立检索的问题；
+- `needs_clarification=true`：信息不足，返回 clarification；
+- 直接由会话历史/学习记忆渲染答案，不进入论文 RAG。
+
+会话或学习记忆回答没有论文 Citation，并会明确说明它是历史信息，不是论文证据。
+
+### 7.4 执行和落库
+
+RAG 执行通过 `asyncio.to_thread()` 调用同步内核。结果返回后：
+
+1. 检查是否请求取消；
+2. 发布经校验的答案分片；
+3. 在一个事务中插入助手 Message 并结束 Run；
+4. 更新 Conversation 标题、summary、memory；
+5. 写入长期记忆条目；
+6. 发布 completed/partial/failed/cancelled 终态事件。
+
+只有结果 `status=ok` 映射为 completed，其他可返回内容通常映射为 partial。
+
+## 8. Router 数据流
+
+输入：解析后的独立问题。
+
+规则特征包括：
+
+- Figure/Table 显式编号；
+- 颜色、形状、位置、箭头等视觉词；
+- 行、列、指标、数值比较等表格词；
+- 需要方法 + 图/表联合解释的复杂表达。
+
+输出至少包含：
+
+- `mode: standard | agentic`；
+- `modalities`；
+- 是否为纯视觉/纯表格；
+- 路由理由。
+
+Router 只决定入口和所需模态，不直接检索、不拆完整任务、不判断最终证据是否充分。
+
+## 9. Standard RAG 数据流
 
 ```text
-PaperLens
-  ├─ /metrics --------------------> Prometheus ----> Grafana Dashboard
-  ├─ OpenTelemetry OTLP/HTTP ----> OTel Collector -> Tempo -> Grafana Explore
-  └─ JSON Structured Logs -------> Console
+Question
+ -> ReadingService.plan_query
+ -> HybridRetriever.search_with_trace
+ -> top Chunk + candidate Sentence
+ -> DeepSeek 生成 atomic claims + sentence IDs
+ -> claim verifier
+ -> supported claims
+ -> Answer + Sentence Citations + retrieval trace
 ```
 
-### 13.1 Metrics
+### 9.1 混合检索
 
-Prometheus 指标覆盖：
+- BM25：对专有名词、缩写、数字、公式词面更敏感；
+- Dense：BGE-M3 编码问题，Qdrant 计算余弦相似度；
+- RRF：使用 `1/(60+rank)` 合并两个排序；
+- Reranker：CrossEncoder 对候选 query-document 对进行重排。
 
-- HTTP 请求和失败
-- Run 数量、状态、活跃数和 P95
-- LangGraph Node P95
-- Tool/Function Calling 成功、回退、拒绝和熔断状态
-- DeepSeek/Qwen-VL 请求、延迟和 Token
-- 长期记忆写入与生命周期
+在线模式中某个后端失败可降级；评测严格模式会抛错，防止指标在不同检索条件下被混在一起。
 
-Grafana 中 `/5m` 面板使用 `increase(...[5m])` 表示窗口内真实次数；进程生命周期累计 Counter 使用 `sum(counter) or vector(0)`，避免首次序列和无数据造成假零或 `No data`。
+### 9.2 生成与校验
 
-### 13.2 Trace
+`answer_with_evidence()` 不直接让模型输出长答案，而是先要求最多若干条原子 Claim，每条绑定候选 Sentence ID。服务端先检查 ID 是否真实存在，再调用独立 verifier 判断支持程度。
 
-每轮会话根 Span 为 `paperlens.conversation_run`，保存：
+无受支持 Claim 时返回结构化拒答；因此输出中的 `answerable/status/citations` 是数据流的一部分，不是仅靠自然语言表达“不知道”。
 
-- `run_id`
-- `conversation_id`
-- `paper_id`
-- `question_preview`（最多240字符）
-- `question_length`
+## 10. Agentic RAG 数据流
 
-可在 Grafana Explore 的 Tempo 数据源使用：
+### 10.1 Graph State
 
-```traceql
-{ resource.service.name = "paperlens" && span.run_id = "<run_id>" }
+State 保存：
+
+- 原问题和 resolved question；
+- Router 输出；
+- Supervisor plan 与 typed tasks；
+- `agent_results`；
+- 去重后的 Evidence；
+- Critic 决策；
+- step/model/Qwen/retry/timeout 预算；
+- Trace steps、warnings、errors；
+- 最终 Answer。
+
+列表字段通过加法 Reducer 合并，Evidence 按 `evidence_id` 去重，字典结果按 Agent/任务键合并。
+
+### 10.2 图节点
+
+```text
+START
+ -> plan
+ -> dispatch_specialists
+ -> evidence_critic
+      approved/partial -> answer -> END
+      retry            -> repair_dispatch -> evidence_critic
+      refuse           -> structured_refusal -> END
 ```
 
-也可以按模型搜索：
+Planner 逻辑在 Supervisor plan 节点内部，不是单独的 LLM 节点。
 
-```traceql
-{ resource.service.name = "paperlens" && name = "provider.qwen_vl" }
+### 10.3 Specialist 调度
+
+Supervisor 把逻辑任务按模态展开。默认正常应用配置是串行；启用并行且任务数大于一时，Scheduler 用最多有限工作线程并发执行。
+
+串行超时只能在一次任务返回后判定；并行超时可以停止等待并取消尚未开始的 Future，但已经运行的 Python 线程和 Provider 请求不能被强制杀死。
+
+### 10.4 Evidence Critic 与定向返工
+
+Critic 从任务要求和结果中计算可用模态，并检查 Specialist 报告的冲突。若只缺 Figure，不会重做 Text/Table，而是选择首个可重试的缺失任务进入 repair。
+
+重试耗尽或关键证据仍不可用时，进入 partial 或 structured refusal。
+
+### 10.5 Answer
+
+Answer Agent 将 State Evidence 转回 `EvidenceObject`，过滤不可用 Figure，再调用 `answer_from_evidence()`。它生成 Claim、绑定真实 Evidence ID、执行 verifier，并按 Router 所需模态检查覆盖率。
+
+Critic 的 partial 状态会传递到最终状态，不能被流畅答案掩盖。
+
+## 11. Function Calling 循环
+
+每个 Specialist 的真实循环：
+
+1. Tool Registry 根据 Agent 返回白名单 Schema；
+2. DeepSeek `tool_completion()` 返回一个或多个 tool calls；
+3. 检查模型轮次和工具步数预算；
+4. 校验工具名、JSON、类型、必填字段、数值范围；
+5. 执行模态相关语义约束；
+6. 检查重复调用；
+7. 执行本地 EvidenceTools；
+8. 把统一结果信封作为 tool message 回传模型；
+9. 检查模态完成条件；
+10. 生成 Specialist result。
+
+白名单：
+
+- Text：`search_text`、`read_sentence`；
+- Figure：`search_figures`、`read_figure`、`analyze_figure_for_query`；
+- Table：`search_tables`、`read_table`、`analyze_table_image_with_vlm`。
+
+如果循环异常、没有 Evidence、重复调用、超预算或没有满足完成条件，`BaseSpecialistAgent` 记录 `function_calling_fallback`，然后运行固定流程。
+
+目标 ID 约束的真实程度：Figure/Table 在已发现候选集合非空时拒绝集合外 ID；Text 没有完全同等的 discovered-set 约束。所有工具仍绑定当前 Paper 对象，模型不能通过参数跨论文读取。
+
+## 12. 三种模态的在线工具链
+
+### 12.1 Text
+
+```text
+search_text(query)
+ -> HybridRetriever 排名非 Table Chunk
+ -> 每个 Chunk 选择最多有限相关 Sentence
+ -> Sentence Evidence(page, bboxes, content)
 ```
 
-Trace 瀑布图展示模型调用开始时间和持续时间；LangGraph、Tool 和 Function Calling 细节作为 Span Events 记录。成功的自定义 Span 显式标记为 `OK`，异常 Span 标记为 `ERROR` 并记录错误类型。
+固定 Text 流程通常不需要额外 `read_sentence`，因为 `search_text` 已返回句子证据；Function Calling 模式可按需读取特定句子。
 
-### 13.3 日志安全
+### 12.2 Figure
 
-JSON 日志携带 request/run/conversation/paper 关联字段，但 Prometheus Label 不使用这些高基数字段。API Key、Authorization、Prompt 和论文正文会被隐藏或截断。
+```text
+search_figures(query)
+ -> 显式 Figure N 精确匹配或混合检索
+ -> read_figure(id)
+ -> analyze_figure_for_query(id, original_question)
+ -> Qwen-VL 原图分析结果
+```
 
-## 14. 异常恢复
+查询缓存键包含 paper、figure、规范化 question 和 cache version。缓存命中可以避免重复视觉调用；跨模态依赖仍会基于当前问题重新整理。
 
-| 异常 | 处理方式 |
+### 12.3 Table
+
+```text
+search_tables(query)
+ -> 显式 Table N 精确匹配或混合检索
+ -> read_table(id)
+ -> columns/rows/content
+ -> 可选 VLM fallback
+```
+
+Table VLM fallback 受配置、Qwen 预算、图片存在性和目标 ID 约束，默认不是主路径。
+
+## 13. Evidence、Citation 与原文定位
+
+答案 Citation 返回 Evidence ID、类型、页码、BBox 和必要内容。前端通过：
+
+```text
+GET /api/papers/{paper_id}/evidence/{evidence_id}
+GET /api/papers/{paper_id}/pdf
+GET /api/papers/{paper_id}/figures/{figure_id}
+```
+
+读取原文并高亮对应区域。
+
+Sentence 可能跨多行，因此保存 `bboxes`；兼容接口也保留单个 `bbox`。Figure/Table 通常对应一个 Docling item 区域。
+
+Evidence ID 校验能防止模型引用完全不存在的对象，但不能把 verifier 变成形式化证明；部分支持、解析误差和 Gold 标注不完整仍需评测和人工抽检发现。
+
+## 14. SSE、重连与取消数据流
+
+### 14.1 事件发布
+
+`RunManager.publish(run_id, event, data)`：
+
+- 为事件分配递增 ID；
+- 放入固定长度 deque；
+- 唤醒等待该 Run 的 SSE 客户端；
+- terminal 事件后关闭运行通道。
+
+事件包括运行状态、路由、节点开始/结束、工具调用、Critic、答案分片和终态。
+
+### 14.2 重连
+
+客户端携带 `Last-Event-ID` 时，服务端从仍在内存缓冲区中的下一条事件继续发送。超过缓冲窗口、服务重启或连接到另一个 Worker 后，旧事件可能无法恢复，但最终 Run 和 Message 仍可从 SQLite 查询。
+
+### 14.3 答案分片
+
+`_publish_answer()` 接收已经完成校验的完整字符串，按固定字符数发布 `answer.delta`。所以：
+
+- 工作流事件是真实时的；
+- 答案正文不是 Provider Token Streaming；
+- 未经校验的模型草稿不会暴露给用户。
+
+### 14.4 取消
+
+取消接口写 SQLite `cancel_requested`，并发布取消请求事件。执行协程在进入 RAG 前、阻塞调用返回后和持久化前检查。已发出的同步 Provider 请求仍会运行到返回，这是当前协作式取消的边界。
+
+## 15. 长期记忆数据流
+
+### 15.1 写入
+
+每轮 Conversation Run 结束后，`LongTermMemoryService.record_run()` 根据结果创建条目：
+
+- completed + answerable + Citation -> active；
+- 其他可记录结果 -> unresolved。
+
+使用来源 Run 和内容 fingerprint 避免重复回填。用户已标 forgotten 的条目不会因同样内容再次写入而自动复活。
+
+### 15.2 聚合
+
+`refresh_aggregate()` 生成：
+
+- 已学习问题摘要；
+- explored sections；
+- 已查看 Figure/Table ID；
+- unresolved questions；
+- 生命周期计数。
+
+Query Resolver 获取的是有长度上限的导航信息，不会把所有历史回答塞进 Prompt。
+
+### 15.3 生命周期
+
+- retention 到期：未置顶条目归档；
+- 超过每篇论文容量：优先归档低重要性、未置顶条目；
+- pin：取消 TTL；
+- unpin：重新设置 TTL；
+- reanalyze：旧版本 active -> stale；
+- forget：状态设为 forgotten；
+- edit：可改问题、摘要、重要性、备注或状态。
+
+当前隔离键为 `paper_id + user_scope`，默认 scope 是 `local`，没有身份认证。
+
+## 16. 可观测数据流
+
+### 16.1 指标
+
+```text
+FastAPI /metrics
+ -> Prometheus 每 10 秒抓取 host.docker.internal:8010
+ -> Grafana Prometheus datasource
+ -> System / Agents & Tools / Models & Memory Dashboard
+```
+
+指标覆盖 HTTP、Run、活跃 Run、节点耗时、工具调用和拒绝、Function fallback、熔断、模型请求、Token 和记忆操作。
+
+### 16.2 Trace
+
+```text
+app/observability.py spans
+ -> OTLP HTTP :4318
+ -> OpenTelemetry Collector
+ -> Tempo
+ -> Grafana Tempo datasource
+```
+
+Conversation 根 Span 包含 request/run/conversation/paper 等安全关联字段；子 Span 覆盖检索、图节点、工具和模型调用。应用 Trace API 返回的是 SQLite 中保存的业务执行 Trace，与 Tempo 分布式 Trace 相关但不是同一个存储。
+
+### 16.3 日志安全
+
+结构化日志会过滤 Authorization、API Key、完整 Prompt/正文等敏感值，只保留必要 ID、状态、长度和截断预览。生产环境仍需外部密钥管理、访问审计和数据保留策略。
+
+## 17. Evaluation 数据流
+
+`scripts/evaluate.py`：
+
+1. 按 dataset `split` 读取 Case；
+2. Retrieval 模式以严格后端条件计算排名指标；
+3. RAG 模式调用与应用相同的 Router/Standard/Agent Executor；
+4. 收集 Citation、Agent Trace、延迟、失败和恢复信息；
+5. 可回答文本题使用 DeepSeek Judge；
+6. 视觉题可使用独立 Qwen-VL Visual Judge 重新看原图；
+7. 不可回答题按预期拒答判断；
+8. 汇总 Retrieval、Evidence、Execution、Answer、Task 指标；
+9. 报告写入完整 configuration 和逐 Case 记录。
+
+`Task Success` 不是单纯的语言相似度，它要求执行、可回答性、答案正确性和证据条件共同满足。
+
+最新冻结结果只覆盖 v4 Dev 36 条。不要把历史 v2 Test 8/8 与 v4 Dev 合并，也不要在完成 v4 Test 前声称其结果。
+
+## 18. 三个端到端示例
+
+### 18.1 简单正文事实
+
+输入：“作者使用什么损失函数？”
+
+```text
+Resolver: 独立问题
+Router: standard/text
+Rewrite: 英文 lexical query + 多语言 semantic query
+Retriever: BM25 + Dense -> RRF -> Reranker
+Reading: Chunk -> Sentence -> Claim -> verifier
+输出: answer + sentence_id + page/bbox + retrieval trace
+```
+
+失败：没有受支持句子时拒答，不进入 Figure Agent。
+
+### 18.2 Figure 视觉问题
+
+输入：“Figure 2 中红色箭头连接了哪些模块？”
+
+```text
+Router: agentic/figure/pure_visual
+Planner: 保留 Figure 2 和视觉关系词
+Figure Specialist: 精确找 Figure 2 -> 读图 -> Qwen-VL 按问题分析
+Critic: 检查 answerable 和 Figure Evidence
+Answer: 基于视觉 Evidence 合成并引用 Figure 2
+```
+
+失败：Function Calling 未执行视觉分析时触发固定流程；Qwen-VL 仍不可用则 partial/refusal。
+
+### 18.3 Figure + Text + Table 综合问题
+
+输入：“结合方法图和消融表，哪个组件对应最大的性能提升，作者如何解释？”
+
+```text
+Router: agentic/text+figure+table
+Supervisor: 三个 typed tasks
+Scheduler: 按配置串行或并行
+Text: 找作者解释
+Figure: 找模块关系并看原图
+Table: 读取行列和数值
+Reducer: 按 evidence_id 合并
+Critic: 检查三模态覆盖与冲突
+Answer: 跨模态 Claim + Citation
+```
+
+失败：缺一个关键模态时只定向返工该任务；仍失败则明确 partial 或拒答。
+
+## 19. 运行边界速查
+
+| 容易误解的说法 | 当前事实 |
 |---|---|
-| Docling 失败 | 降级到 PyMuPDF |
-| Dense/Reranker 未启用 | 非 strict 模式记录 warning 并使用可用后端 |
-| 外部模型临时失败 | 有界指数退避重试 |
-| Function Calling 协议错误 | 记录回退并执行固定 Specialist 流程 |
-| 连续 Function Calling 失败 | 熔断，冷却后恢复试探 |
-| 缺失模态 Evidence | Critic 定向返工一次 |
-| Evidence 仍不足 | 结构化拒答或 partial |
-| Run 重复提交 | `client_message_id` 幂等返回原 Run |
-| 同会话并发提交 | SQLite 唯一约束拒绝第二个活跃 Run |
-| 页面刷新 | 从 SQLite 恢复消息和最终状态 |
-| 论文重新解析 | 旧解析版本记忆转为 stale |
+| 上传是异步任务队列 | 线程池执行但请求等待；没有分布式队列 |
+| 所有 completed 论文都已成功建向量索引 | 索引失败仍可能保存 completed 降级状态 |
+| Planner 是 LLM Agent | 当前是确定性规则组件 |
+| Graph 在线使用 conversation:turn checkpoint | 执行器支持，但 main 当前未传入，通常用 Run UUID |
+| Function Calling ID 全部来自本轮搜索 | Figure/Table 仅在候选非空时严格检查，Text 约束不同 |
+| SSE 是模型 Token Streaming | 工作流事件实时；答案在校验后按字符分片 |
+| cancel 会立刻终止模型请求 | 只能在协作边界结束 Run |
+| 长期记忆可以直接证明论文事实 | 只能辅助导航，答案仍需当前 Evidence |
+| Compose 启动完整应用 | Compose 只含基础设施，FastAPI 通常由本地 Uvicorn 启动 |
+| 36/36 等于真实准确率 100% | 只是 5 篇论文上的 v4 Dev judge-enabled 结果 |
 
-## 15. Evaluation 数据流
+## 20. 关键代码入口
 
-当前 v4 Benchmark 包含 5 篇论文、60 条带结构化 Gold 标注的问题，每篇 12 条；Dev 36 条、Test 24 条，可回答 50 条、不可回答 10 条。题型覆盖文本、表格、纯视觉、跨模态和拒答。数据集已完成结构、Evidence ID、页码和原文引用校验；当前只完整运行了 36 条 Dev，24 条 v4 Test 保留为后续冻结评测。
-
-评测分别计算：
-
-- Retrieval Recall@K、MRR
-- Evidence Precision、Recall、F1
-- Modality Routing Accuracy
-- Execution Success
-- Answer Correct（只有 Judge 可用时确定）
-- Task Success（执行和答案同时正确）
-- Answerability/Refusal Accuracy
-- 延迟、Token、Agent、Tool 和 Qwen-VL 调用
-
-视觉题使用独立 Qwen-VL Judge 重新查看 Gold Figure，避免回答链路使用自己的视觉分析自证。最新 v4 Dev 最终结果为 36/36 Task Success，Answerability、Refusal 和 Modality Routing Accuracy 均为 100%，Gold Citation Hit 为 100%，Complete Gold Citation Hit 为 93.33%，平均/P95 延迟为 10.53 s / 36.67 s。两条跨模态题使用了语义等价的替代正文证据，因此严格完整 Gold ID 未达到 100%，但语义答案和实际引用均通过 Judge。
-
-历史 v2 曾按论文隔离为 Dev 12 / Test 8，并在冻结配置后运行一次 Test；该结果用于证明独立 Test 流程，不能与 v4 Dev 合并统计。后续若运行 v4 Test，应保持当前配置不变、只运行一次，并保留原始报告。
-
-## 16. 三个端到端示例
-
-### 16.1 简单文本事实
-
-```text
-用户问题 -> Query Resolver -> Router -> Standard RAG
--> Hybrid Retrieval -> Sentence Evidence -> Answer -> Claim Verification
--> Citation -> SSE -> SQLite -> active memory
-```
-
-### 16.2 Figure 视觉问题
-
-```text
-用户问题 -> Router(figure) -> Supervisor -> Figure Agent
--> search_figures -> read_figure -> analyze_figure_for_query(Qwen-VL)
--> Evidence Critic -> Answer Agent -> Figure Citation
-```
-
-### 16.3 Figure + Method + Table 综合问题
-
-```text
-用户问题 -> Router(text, figure, table) -> Supervisor
--> Text/Figure/Table Specialists
--> Evidence Reducer
--> Evidence Critic
--> Answer Agent + Claim Verification
--> partial/completed -> memory.record -> Prometheus + Tempo
-```
-
-## 17. 关键代码导航
-
-| 想理解的功能 | 入口文件 |
-|---|---|
-| API 与一次 Run 生命周期 | `app/main.py` |
-| PDF 解析 | `app/services/parser.py` |
-| 混合检索 | `app/services/retrieval.py` |
-| 问题路由 | `app/agent/router.py` |
-| LangGraph 图 | `app/multi_agent/graph.py` |
-| Supervisor | `app/multi_agent/supervisor.py` |
-| Specialist | `app/multi_agent/agents` |
-| Function Calling | `app/multi_agent/function_calling.py` |
-| 工具注册与 Schema | `app/multi_agent/tool_registry.py` |
-| Evidence 工具 | `app/tools/evidence_tools.py` |
-| Query Resolver | `app/services/query_resolver.py` |
-| 会话服务 | `app/services/conversation.py` |
-| 长期记忆 | `app/services/long_term_memory.py` |
-| SSE | `app/services/run_manager.py` |
-| 指标、日志、Trace | `app/observability.py` |
-| 评测 | `app/evaluation`、`scripts/evaluate.py` |
-
-## 18. 当前边界
-
-- 当前主要面向本地单用户部署，没有身份认证和真正的多租户权限系统。
-- SSE 是应用层答案分片，不是提供商原生 Token Streaming。
-- Qwen-VL 是跨模态问题的主要延迟来源，复杂问题可能触发两次视觉调用。
-- Function Calling 可能因空 Evidence 或协议错误回退，但固定流程能够恢复。
-- v4 Benchmark 有 60 条但仍只覆盖 5 篇论文，且当前最终模型结果来自 36 条 Dev，不能代表大规模统计结论或生产准确率。
-- 本地 SQLite、Qdrant 和进程内事件缓冲不适合直接水平扩展，多实例部署需要任务队列、共享状态和集中日志。
+- API 与总流程：`app/main.py`
+- 领域对象：`app/domain.py`
+- 配置：`app/config.py`
+- SQLite：`app/repository.py`
+- 解析：`app/services/parser.py`
+- 检索：`app/services/retrieval.py`
+- 查询计划、生成与校验：`app/services/reading.py`
+- 多轮消歧：`app/services/query_resolver.py`
+- SSE：`app/services/run_manager.py`
+- 长期记忆：`app/services/long_term_memory.py`
+- Router/Planner：`app/agent/`
+- LangGraph：`app/multi_agent/graph.py`
+- Function Calling：`app/multi_agent/function_calling.py`
+- 工具 Schema：`app/multi_agent/tool_registry.py`
+- Evidence 工具：`app/tools/evidence_tools.py`
+- 多模态：`app/multimodal/`
+- 评测：`app/evaluation/`、`scripts/evaluate.py`
+- 可观测：`app/observability.py`、`observability/`

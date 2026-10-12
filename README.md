@@ -2,14 +2,15 @@
 
 Evidence-Grounded Multimodal Agentic RAG for Scientific Paper Reading。
 
-系统保留文本 RAG 与 `sentence_id → page + bbox(es) → PDF.js` 高亮链路，并以 LangGraph 编排 Supervisor、Text/Figure/Table Specialists、Evidence Critic 和 Answer Agent。PaperLens 6.0 支持持久化多轮会话、论文级跨会话学习记忆、实时 LangGraph/Tool 事件，以及带严格 Schema、结果信封、熔断恢复和固定流程回退的生产化 Function Calling。
+系统保留文本 RAG 与 `sentence_id → page + bbox(es) → PDF.js` 高亮链路，并以 LangGraph 编排 Supervisor、Text/Figure/Table Specialists、Evidence Critic 和 Answer Agent。PaperLens 6.0 支持持久化多轮会话、论文级跨会话学习记忆、实时 LangGraph/Tool 事件，以及带严格 Schema、结果信封、熔断恢复和固定流程回退的受约束 Function Calling。
 
 ## 最终交付文档
 
-- [PaperLens 数据流转与运行机制](docs/paperlens-data-flow-and-runtime-guide.md)：从上传、三模态解析、索引、路由、多智能体执行、证据校验、SSE、记忆到 LLMOps 的完整数据流。
+- [PaperLens 系统掌握手册](docs/paperlens-system-mastery-guide.md)：当前代码与冻结报告的事实总纲，覆盖架构、角色、设计取舍、恢复机制和能力边界。
+- [PaperLens 数据流转与运行机制](docs/paperlens-data-flow-and-runtime-guide.md)：按输入、处理、状态、输出和失败路径追踪上传、问答、SSE、记忆与 LLMOps。
+- [PaperLens 面试学习计划](docs/paperlens-interview-study-plan.md)：按 P0/P1/P2 面试优先级组织 7 天任务、代码阅读、动手验证和复述验收。
 - [PaperLens AI 应用开发技术面试题库](docs/paperlens-ai-application-interview-qa.md)：60 道基于当前代码与真实边界编写的问答。
 - [LLMOps 与长期记忆工程指南](docs/llmops-and-long-term-memory.md)：观测组件、指标、Trace、记忆生命周期与验收方式。
-- [简历项目描述](docs/resume-project-description.md)：面向 AI 应用开发实习的项目表述、指标口径与面试边界。
 
 当前冻结版本全量自动化回归结果为 **177 passed**，覆盖解析与检索契约、多智能体编排、Function Calling 与熔断、对话持久化、SSE、长期记忆、评测指标、Trace 关联字段和 Grafana 查询口径。扩展后的 v4 Benchmark 共 60 条，其中完整运行的 Dev 为 36 条；该结果表示固定数据集上的回归与模型评测表现，不等同于真实业务场景的普遍准确率。
 
@@ -92,7 +93,7 @@ flowchart TD
     LONG_MEMORY --> RECOVER
 ```
 
-Conversation Memory 只理解当前会话中的“它、上一张图、刚才的表格”等上下文；Paper Learning Memory 按论文记录跨会话的已验证问答、章节/图表进度和未解决问题。两者都不能作为论文事实 Citation，每轮仍会重新检索并构建 Evidence Memory。LangGraph `thread_id` 使用 `conversation_id:turn_index`，避免上一轮 Plan、预算或错误污染下一轮。
+Conversation Memory 只理解当前会话中的“它、上一张图、刚才的表格”等上下文；Paper Learning Memory 按论文记录跨会话的已验证问答、章节/图表进度和未解决问题。两者都不能作为论文事实 Citation，每轮仍会重新检索并构建 Evidence Memory。LangGraph Executor 支持用 `conversation_id:turn_index` 作为 `thread_id`，但当前在线入口没有传入这两个参数，实际通常使用本轮 Run UUID 隔离 checkpoint。
 
 ### 单轮 RAG 内核与 LangGraph 多智能体编排
 
@@ -175,7 +176,7 @@ Router 只负责入口分流、复杂度和模态识别；Planner 是 Supervisor
 - Table：Docling Markdown 同时保留为原文、列名和行对象，经 BM25/Dense 检索；结构化表不可读时可通过 `TABLE_VLM_FALLBACK_ENABLED` 显式启用 Qwen‑VL fallback。
 - Agent：Supervisor 生成 typed sub-tasks，Text/Figure/Table Agents 只调用白名单工具；Critic 检查模态覆盖和数值冲突，并最多定向返工一次。
 - Evidence：`text | figure | table` 统一为 `evidence_id/type/page/bbox/content/section/metadata`；旧 sentence_id 不变。
-- Verification：所有模型返回 ID 都先与候选集合比对；unsupported claim 会被删除。
+- Verification：答案生成返回的 Evidence/Sentence ID 会与候选映射比对，unsupported claim 会被删除；Function Calling 中 Figure/Table 的本轮候选 ID 校验只在候选集合非空时严格执行，Text 工具约束并不完全相同。
 - Recovery：外部 API 有限指数退避、节点超时、工具/模型/Qwen‑VL 预算、SQLite Checkpoint 和结构化错误；网络重试与 Critic 返工分开统计。
 - Trace：记录 router、plan、每个 Agent/Node/Tool、result IDs、缓存命中、延迟、token usage、Qwen-VL 调用、Critic 决策与恢复结果。
 - Evaluation：比较 `standard_rag`、`text_agentic_rag`、`multimodal_agentic_rag`；各模态独立计算 Top-K，并分开报告执行成功与答案正确。
@@ -234,7 +235,7 @@ Grafana 中标题带 `/ 5m` 的请求、Run、Tool、模型和记忆面板统一
 
 - 只有 `completed + answerable=true + 至少一个 Citation` 的回答进入 `active`；拒答和 partial 进入 `unresolved`，不会被当成可靠事实。
 - 每条记忆保存来源会话、来源 Run、解析版本、Evidence ID/模态、章节、置信度、重要性、到期时间和用户备注，可完整追溯。
-- 论文重新解析后，旧解析版本的记忆（包括置顶项）转为 `stale`，避免引用失效证据；普通记忆到期后转为 `archived`，置顶只跳过过期，不跳过版本失效。
+- 论文重新解析后，旧解析版本的 `active` 记忆（包括置顶项）转为 `stale`，避免引用失效证据；当前代码不会自动把旧 `unresolved` 改为 `stale`。普通记忆到期后转为 `archived`，置顶只跳过过期，不跳过 active 版本失效。
 - 支持历史 Run 幂等回填、容量上限、自动遗忘、置顶、备注和主动忘记。旧版聚合记忆在完成回填前保留，不会因升级被直接清空。
 - 当前记忆按 `paper_id + local user_scope` 隔离；尚未接入登录体系，因此不能将它描述为完整多租户隔离。
 
@@ -350,6 +351,8 @@ python scripts\evaluate.py --dataset evals\questions.v4.jsonl --split dev --mode
 
 ## 已知边界
 
+- v4 的 24 条 Test 尚未完成一次正式冻结评测；当前 36/36 只属于 5 篇论文上的 v4 Dev judge-enabled 结果，不能解释为现实准确率 100% 或开放世界泛化能力。
+- 项目没有进行模型训练、微调或模型结构研究；PaperLens 主项目也没有接入 MCP。
 - 未配置真实 DeepSeek/Qwen-VL Key 时，解析与检索可运行，但生成或视觉阅读会明确返回 unavailable；不会伪造模型结果。
 - PyMuPDF 降级路径只能导出 PDF 内嵌且足够大的位图；复杂矢量 Figure 仍依赖 Docling 的区域渲染质量。
 - Table VLM fallback 默认关闭；启用后会增加 Qwen‑VL 成本，结构化与视觉结果均不可用时会返回 partial/refusal。
@@ -359,4 +362,6 @@ python scripts\evaluate.py --dataset evals\questions.v4.jsonl --split dev --mode
 - 论文级长期记忆当前使用本机 `local` 用户范围，尚未接入登录、RBAC、多租户隔离或向量化自由文本记忆。
 - SSE 事件缓冲位于单进程内存，多 Worker 部署前需要迁移到 Redis Streams、NATS 等共享事件总线。
 - 答案 Delta 是 Claim 核验后的安全文本切片，不是 Provider 原生 token 直出；LangGraph 与 Tool 阶段事件已经是真实执行时发布。
+- 当前是单机应用：Docker Compose 只运行 Qdrant 和观测基础设施，FastAPI 通常由本地 Uvicorn 启动；没有 Kubernetes、分布式任务队列、Qdrant 集群或大规模性能调优。
+- 多智能体是受白名单、预算、状态图和 Critic 约束的 Supervisor–Worker 工作流，不是多个 Agent 自由自治或互相聊天。
 - Web UI 仍是轻量单页 PDF.js 阅读器，支持跳页和 bbox 高亮，但没有缩略图、连续滚动或缩放控件。
